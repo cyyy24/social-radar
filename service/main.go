@@ -20,10 +20,10 @@ const (
 	POST_INDEX = "post" // database name (for storing posts into Elastic Search).
 	POST_TYPE  = "post" // database table name.
 
-	DISTANCE        = "200km"                                                                              // search range.
-	ES_URL          = "http://35.196.164.154:9200"                                                         // url & ports of Google Compute Engine VM instance and Elastic Search listening port.
-	BUCKET_NAME     = "socialradar-post-images"                                                            // bucket (folder) name of GCS (Google Cloud Storage).
-	CREDENTIAL_PATH = "/Users/cyyy24/GoogleCloudPlatform/ServiceAccount-key/SocialRadar-576b9b3c0db7.json" // ServiceAccount key path.
+	DISTANCE        = "200km"                         // search range.
+	ES_URL          = "http://35.196.164.154:9200"    // url & ports of Google Compute Engine VM instance and Elastic Search listening port.
+	BUCKET_NAME     = "socialradar-post-images"       // bucket (folder) name of GCS (Google Cloud Storage).
+	CREDENTIAL_FILE = "SocialRadar-576b9b3c0db7.json" // ServiceAccount key file.
 )
 
 // Location struct representing what data location contains.
@@ -231,8 +231,10 @@ func readFromES(lat, lon float64, ran string) ([]Post, error) {
 func saveToGCS(r io.Reader, bucketName, objectName string) (*storage.ObjectAttrs, error) {
 	ctx := context.Background()
 
+	//client, err := storage.NewClient(ctx）
+
 	// Creates a client (with option to pass credential file).
-	client, err := storage.NewClient(ctx, option.WithCredentialsFile(CREDENTIAL_PATH))
+	client, err := storage.NewClient(ctx, option.WithCredentialsFile(CREDENTIAL_FILE))
 	if err != nil {
 		return nil, err
 	}
