@@ -10,6 +10,8 @@ import (
 	"reflect"
 	"strconv"
 
+	"cloud.google.com/go/bigtable"
+
 	"cloud.google.com/go/storage"
 	"github.com/olivere/elastic"
 	"github.com/pborman/uuid"
@@ -24,6 +26,10 @@ const (
 	ES_URL          = "http://35.196.164.154:9200"    // url & ports of Google Compute Engine VM instance and Elastic Search listening port.
 	BUCKET_NAME     = "socialradar-post-images"       // bucket (folder) name of GCS (Google Cloud Storage).
 	CREDENTIAL_FILE = "SocialRadar-576b9b3c0db7.json" // ServiceAccount key file.
+
+	ENABLE_BIGTABLE = true               // Set this to "true" if want to use Google BigTable.
+	PROJECT_ID      = "socialradar"      // for saveToBigTable func.
+	BT_INSTANCE     = "socialradar-post" // BigTable instance id.
 )
 
 // Location struct representing what data location contains.
@@ -32,7 +38,7 @@ type Location struct {
 	Lon float64 `json:"lon"`
 }
 
-// Post struct representing what data a  user post contains.
+// Post struct representing what data a user's post contains.
 type Post struct {
 	// `json:"user"` is for json parsing. Otherwise, by default it's 'User' (Same applies to fields below).
 	User     string   `json:"user"`
@@ -84,6 +90,7 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("Image is not available %v.\n", err)
 		return
 	}
+
 	attrs, err := saveToGCS(file, BUCKET_NAME, id)
 	if err != nil {
 		http.Error(w, "Failed to save image to GCS", http.StatusInternalServerError)
@@ -99,6 +106,10 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fmt.Printf("Saved one post to ElasticSearch: %s", p.Message)
+
+	if ENABLE_BIGTABLE {
+		saveToBigTable(p, id)
+	}
 }
 
 // Function that handles a GET request (search for nearby posts).
@@ -136,7 +147,7 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 /**
  *  Helper functions:
  */
-// Function that creates a table for storing our data if table not already exists.
+// Function that creates a table in ES for storing our data if table not already exists.
 func createIndexIfNotExist() {
 	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
 	if err != nil {
@@ -165,6 +176,31 @@ func createIndexIfNotExist() {
 			panic(err)
 		}
 	}
+}
+
+// Function that helps save a post to Google BigTable for later transmitting data to BigQuery for offline analysis.
+func saveToBigTable(p *Post, id string) {
+	ctx := context.Background()
+	bt_client, err := bigtable.NewClient(ctx, PROJECT_ID, BT_INSTANCE, option.WithCredentialsFile(CREDENTIAL_FILE))
+	if err != nil {
+		panic(err)
+		return
+	}
+
+	tbl := bt_client.Open("post")
+	mut := bigtable.NewMutation()
+	t := bigtable.Now()
+	mut.Set("post", "user", t, []byte(p.User)) // cast to byte[] b/c BigTable stores data in byte array form.
+	mut.Set("post", "message", t, []byte(p.Message))
+	mut.Set("location", "lat", t, []byte(strconv.FormatFloat(p.Location.Lat, 'f', -1, 64)))
+	mut.Set("location", "lon", t, []byte(strconv.FormatFloat(p.Location.Lon, 'f', -1, 64)))
+
+	err = tbl.Apply(ctx, id, mut)
+	if err != nil {
+		panic(err)
+		return
+	}
+	fmt.Printf("Post is saved to BigTable: %s\n", p.Message)
 }
 
 // Function that helps save a post to ElasticSearch on GCE (Google Compute Engine).
@@ -228,6 +264,7 @@ func readFromES(lat, lon float64, ran string) ([]Post, error) {
 }
 
 // Function that helps save the image of a post to GCS (Google Cloud Storage).
+// It will return the MediaLink (url) of the saved image.
 func saveToGCS(r io.Reader, bucketName, objectName string) (*storage.ObjectAttrs, error) {
 	ctx := context.Background()
 
