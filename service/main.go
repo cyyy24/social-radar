@@ -16,6 +16,11 @@ import (
 	"github.com/olivere/elastic"
 	"github.com/pborman/uuid"
 	"google.golang.org/api/option"
+
+	"github.com/gorilla/mux"
+
+	jwtmiddleware "github.com/auth0/go-jwt-middleware"
+	jwt "github.com/dgrijalva/jwt-go"
 )
 
 const (
@@ -52,8 +57,24 @@ func main() {
 	fmt.Println("started-service")
 	createIndexIfNotExist()
 
-	http.HandleFunc("/post", handlerPost)
-	http.HandleFunc("/search", handlerSearch) // a GET request.
+	jwtMiddleware := jwtmiddleware.New(jwtmiddleware.Options{
+		// Validate whether token can be decoded or not.
+		ValidationKeyGetter: func(token *jwt.Token) (interface{}, error) {
+			return []byte(mySigningKey), nil
+		},
+		SigningMethod: jwt.SigningMethodHS256,
+	})
+
+	r := mux.NewRouter()
+	// Add HTTP request methods restriction for the proper handlers.
+	// Also, protect "/post" and "/search" end point with JWT Middleware (now requests to these two end points need to provided a valid token).
+	r.Handle("/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
+	r.Handle("/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET")
+	r.Handle("/signup", http.HandlerFunc(handlerSignup)).Methods("POST")
+	r.Handle("/login", http.HandlerFunc(handlerLogin)).Methods("POST")
+
+	http.Handle("/", r)
+
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
@@ -62,7 +83,7 @@ func main() {
 /**
  *  Handler functions to handle HTTP requests (GET, POST):
  */
-// Function that handles a POST request.
+// Function that handles a POST request (when user wants to post a post).
 func handlerPost(w http.ResponseWriter, r *http.Request) {
 	// Parse from body of request to get a json object.
 	fmt.Println("Received one post request")
@@ -71,11 +92,16 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
 
+	// Get the username from token.
+	user := r.Context().Value("user")
+	claims := user.(*jwt.Token).Claims
+	username := claims.(jwt.MapClaims)["username"]
+
 	lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
 	lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
 
 	p := &Post{
-		User:    r.FormValue("user"),
+		User:    username.(string), // (changed) get the username from token.
 		Message: r.FormValue("message"),
 		Location: Location{
 			Lat: lat,
@@ -154,6 +180,7 @@ func createIndexIfNotExist() {
 		panic(err)
 	}
 
+	// Create "post" index into ES to store users' posts.
 	exists, err := client.IndexExists(POST_INDEX).Do(context.Background())
 	if err != nil {
 		panic(err)
@@ -176,6 +203,20 @@ func createIndexIfNotExist() {
 			panic(err)
 		}
 	}
+
+	// Create "user" index into ES for storing user info.
+	exists, err = client.IndexExists(USER_INDEX).Do(context.Background())
+	if err != nil {
+		panic(err)
+	}
+
+	if !exists {
+		_, err = client.CreateIndex(USER_INDEX).Do(context.Background())
+		if err != nil {
+			panic(err)
+		}
+	}
+
 }
 
 // Function that helps save a post to Google BigTable for later transmitting data to BigQuery for offline analysis.
