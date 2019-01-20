@@ -21,6 +21,8 @@ import (
 
 	jwtmiddleware "github.com/auth0/go-jwt-middleware"
 	jwt "github.com/dgrijalva/jwt-go"
+
+	"path/filepath"
 )
 
 const (
@@ -32,9 +34,24 @@ const (
 	BUCKET_NAME     = "socialradar-post-images"       // bucket (folder) name of GCS (Google Cloud Storage).
 	CREDENTIAL_FILE = "SocialRadar-576b9b3c0db7.json" // ServiceAccount key file.
 
-	ENABLE_BIGTABLE = true               // Set this to "true" if want to use Google BigTable.
+	ENABLE_BIGTABLE = false              // Set this to "true" if want to use Google BigTable.
 	PROJECT_ID      = "socialradar"      // for saveToBigTable func.
 	BT_INSTANCE     = "socialradar-post" // BigTable instance id.
+	API_PREFIX      = "/api/v1"
+)
+
+var (
+	mediaTypes = map[string]string{
+		".jpeg": "image",
+		".jpg":  "image",
+		".gif":  "image",
+		".png":  "image",
+		".mov":  "video",
+		".mp4":  "video",
+		".avi":  "video",
+		".flv":  "video",
+		".wmv":  "video",
+	}
 )
 
 // Location struct representing what data location contains.
@@ -50,6 +67,8 @@ type Post struct {
 	Message  string   `json:"message"`
 	Location Location `json:"location"`
 	Url      string   `json:"url"`
+	Type     string   `json:"type"`
+	Face     float64  `json:"face"` // score of if an image contains a face.
 }
 
 // ------------------ MAIN FUNCTION ------------------
@@ -68,12 +87,15 @@ func main() {
 	r := mux.NewRouter()
 	// Add HTTP request methods restriction for the proper handlers.
 	// Also, protect "/post" and "/search" end point with JWT Middleware (now requests to these two end points need to provided a valid token).
-	r.Handle("/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
-	r.Handle("/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET")
-	r.Handle("/signup", http.HandlerFunc(handlerSignup)).Methods("POST")
-	r.Handle("/login", http.HandlerFunc(handlerLogin)).Methods("POST")
+	r.Handle(API_PREFIX+"/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST", "OPTIONS")
+	r.Handle(API_PREFIX+"/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET", "OPTIONS")
+	r.Handle(API_PREFIX+"/cluster", jwtMiddleware.Handler(http.HandlerFunc(handlerCluster))).Methods("GET", "OPTIONS")
 
-	http.Handle("/", r)
+	r.Handle(API_PREFIX+"/login", http.HandlerFunc(handlerLogin)).Methods("POST", "OPTIONS")
+	r.Handle(API_PREFIX+"/signup", http.HandlerFunc(handlerSignup)).Methods("POST", "OPTIONS")
+
+	// Backend endpoints.
+	http.Handle(API_PREFIX+"/", r)
 
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
@@ -86,11 +108,15 @@ func main() {
 // Function that handles a POST request (when user wants to post a post).
 func handlerPost(w http.ResponseWriter, r *http.Request) {
 	// Parse from body of request to get a json object.
-	fmt.Println("Received one post request")
-
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	fmt.Println("Received one post request")
 
 	// Get the username from token.
 	user := r.Context().Value("user")
@@ -117,6 +143,27 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	im, header, _ := r.FormFile("image")
+	defer im.Close()
+	suffix := filepath.Ext(header.Filename) // get the file name and extention.
+
+	// Client needs to know the media type so as to render it.
+	if t, ok := mediaTypes[suffix]; ok {
+		p.Type = t
+	} else {
+		p.Type = "unknown"
+	}
+	// ML Engine only supports jpeg.
+	if suffix == ".jpeg" {
+		if score, err := annotate(im); err != nil {
+			http.Error(w, "Failed to annotate the image", http.StatusInternalServerError)
+			fmt.Printf("Failed to annotate the image %v\n", err)
+			return
+		} else {
+			p.Face = score
+		}
+	}
+
 	attrs, err := saveToGCS(file, BUCKET_NAME, id)
 	if err != nil {
 		http.Error(w, "Failed to save image to GCS", http.StatusInternalServerError)
@@ -140,10 +187,16 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 
 // Function that handles a GET request (search for nearby posts).
 func handlerSearch(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("Received one request for search")
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	fmt.Println("Received one request for search")
 
 	lat, _ := strconv.ParseFloat(r.URL.Query().Get("lat"), 64)
 	lon, _ := strconv.ParseFloat(r.URL.Query().Get("lon"), 64)
@@ -164,6 +217,77 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "Failed to parse posts into JSON format", http.StatusInternalServerError)
 		fmt.Printf("Failed to parse posts into JSON format %v.\n", err)
+		return
+	}
+
+	w.Write(js)
+}
+
+// Handler GET request sent to /cluster (e.g. searching for all face images).
+func handlerCluster(w http.ResponseWriter, r *http.Request) {
+	// Parse from body of request to get a json object.
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+	// To handle if the HTTP request method is OPTIONS.
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	if r.Method != "GET" {
+		return
+	}
+
+	fmt.Println("Received one cluster request")
+
+	term := r.URL.Query().Get("term")
+
+	// Create a client
+	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
+	if err != nil {
+		http.Error(w, "ES is not setup", http.StatusInternalServerError)
+		fmt.Printf("ES is not setup %v\n", err)
+		return
+	}
+
+	// Range query.
+	// For details, https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-range-query.html
+	q := elastic.NewRangeQuery(term).Gte(0.9)
+
+	searchResult, err := client.Search().
+		Index(POST_INDEX).
+		Query(q).
+		Pretty(true).
+		Do(context.Background())
+	if err != nil {
+		// Handle error
+		m := fmt.Sprintf("Failed to query ES %v", err)
+		fmt.Println(m)
+		http.Error(w, m, http.StatusInternalServerError)
+	}
+
+	// searchResult is of type SearchResult and returns hits, suggestions,
+	// and all kinds of other information from Elasticsearch.
+	fmt.Printf("Query took %d milliseconds\n", searchResult.TookInMillis)
+	// TotalHits is another convenience function that works even when something goes wrong.
+	fmt.Printf("Found a total of %d post\n", searchResult.TotalHits())
+
+	// Each is a convenience function that iterates over hits in a search result.
+	// It makes sure you don't need to check for nil values in the response.
+	// However, it ignores errors in serialization.
+	var typ Post
+	var ps []Post
+	for _, item := range searchResult.Each(reflect.TypeOf(typ)) {
+		p := item.(Post)
+		ps = append(ps, p)
+
+	}
+	js, err := json.Marshal(ps)
+	if err != nil {
+		m := fmt.Sprintf("Failed to parse post object %v", err)
+		fmt.Println(m)
+		http.Error(w, m, http.StatusInternalServerError)
 		return
 	}
 
